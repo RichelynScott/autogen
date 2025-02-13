@@ -324,7 +324,7 @@ export const TeamNode = memo<NodeProps<CustomNode>>((props) => {
             </div>
           )}
           <DroppableZone
-            id={`${props.id}-termination-zone`}
+            id={`${props.id}@@@termination-zone`}
             accepts={["termination"]}
           >
             <div className="text-secondary text-xs my-1 text-center">
@@ -392,9 +392,9 @@ export const AgentNode = memo<NodeProps<CustomNode>>((props) => {
             /> */}
 
             <div className="relative">
-              {component.config.model_client && (
+              {component.config?.model_client && (
                 <div className="text-sm">
-                  {component.config.model_client.config.model}
+                  {component.config?.model_client.config?.model}
                 </div>
               )}
               <DroppableZone
