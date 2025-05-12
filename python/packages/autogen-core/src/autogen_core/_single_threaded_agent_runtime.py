@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import sys
 import uuid
@@ -159,6 +160,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
         intervention_handlers (List[InterventionHandler], optional): A list of intervention
             handlers that can intercept messages before they are sent or published. Defaults to None.
         tracer_provider (TracerProvider, optional): The tracer provider to use for tracing. Defaults to None.
+        ignore_unhandled_exceptions (bool, optional): Whether to ignore unhandled exceptions in that occur in agent event handlers. Any background exceptions will be raised on the next call to `process_next` or from an awaited `stop`, `stop_when_idle` or `stop_when`. Note, this does not apply to RPC handlers. Defaults to True.
 
     Examples:
 
@@ -248,6 +250,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
         *,
         intervention_handlers: List[InterventionHandler] | None = None,
         tracer_provider: TracerProvider | None = None,
+        ignore_unhandled_exceptions: bool = True,
     ) -> None:
         self._tracer_helper = TraceHelper(tracer_provider, MessageRuntimeTracingConfig("SingleThreadedAgentRuntime"))
         self._message_queue: Queue[PublishMessageEnvelope | SendMessageEnvelope | ResponseMessageEnvelope] = Queue()
@@ -261,6 +264,8 @@ class SingleThreadedAgentRuntime(AgentRuntime):
         self._subscription_manager = SubscriptionManager()
         self._run_context: RunContext | None = None
         self._serialization_registry = SerializationRegistry()
+        self._ignore_unhandled_handler_exceptions = ignore_unhandled_exceptions
+        self._background_exception: BaseException | None = None
 
     @property
     def unprocessed_messages_count(
@@ -271,6 +276,55 @@ class SingleThreadedAgentRuntime(AgentRuntime):
     @property
     def _known_agent_names(self) -> Set[str]:
         return set(self._agent_factories.keys())
+
+    async def _create_otel_attributes(
+        self,
+        sender_agent_id: AgentId | None = None,
+        recipient_agent_id: AgentId | None = None,
+        message_context: MessageContext | None = None,
+        message: Any = None,
+    ) -> Mapping[str, str]:
+        """Create OpenTelemetry attributes for the given agent and message.
+
+        Args:
+            sender_agent (Agent, optional): The sender agent instance.
+            recipient_agent (Agent, optional): The recipient agent instance.
+            message (Any): The message instance.
+
+        Returns:
+            Attributes: A dictionary of OpenTelemetry attributes.
+        """
+        if not sender_agent_id and not recipient_agent_id and not message:
+            return {}
+        attributes: Dict[str, str] = {}
+        if sender_agent_id:
+            sender_agent = await self._get_agent(sender_agent_id)
+            attributes["sender_agent_type"] = sender_agent.id.type
+            attributes["sender_agent_class"] = sender_agent.__class__.__name__
+        if recipient_agent_id:
+            recipient_agent = await self._get_agent(recipient_agent_id)
+            attributes["recipient_agent_type"] = recipient_agent.id.type
+            attributes["recipient_agent_class"] = recipient_agent.__class__.__name__
+
+        if message_context:
+            serialized_message_context = {
+                "sender": str(message_context.sender),
+                "topic_id": str(message_context.topic_id),
+                "is_rpc": message_context.is_rpc,
+                "message_id": message_context.message_id,
+            }
+            attributes["message_context"] = json.dumps(serialized_message_context)
+
+        if message:
+            try:
+                serialized_message = self._try_serialize(message)
+            except Exception as e:
+                serialized_message = str(e)
+        else:
+            serialized_message = "No Message"
+        attributes["message"] = serialized_message
+
+        return attributes
 
     # Returns the response of the message
     async def send_message(
@@ -372,12 +426,35 @@ class SingleThreadedAgentRuntime(AgentRuntime):
             )
 
     async def save_state(self) -> Mapping[str, Any]:
+        """Save the state of all instantiated agents.
+
+        This method calls the :meth:`~autogen_core.BaseAgent.save_state` method on each agent and returns a dictionary
+        mapping agent IDs to their state.
+
+        .. note::
+            This method does not currently save the subscription state. We will add this in the future.
+
+        Returns:
+            A dictionary mapping agent IDs to their state.
+
+        """
         state: Dict[str, Dict[str, Any]] = {}
         for agent_id in self._instantiated_agents:
             state[str(agent_id)] = dict(await (await self._get_agent(agent_id)).save_state())
         return state
 
     async def load_state(self, state: Mapping[str, Any]) -> None:
+        """Load the state of all instantiated agents.
+
+        This method calls the :meth:`~autogen_core.BaseAgent.load_state` method on each agent with the state
+        provided in the dictionary. The keys of the dictionary are the agent IDs, and the values are the state
+        dictionaries returned by the :meth:`~autogen_core.BaseAgent.save_state` method.
+
+        .. note::
+
+            This method does not currently load the subscription state. We will add this in the future.
+
+        """
         for agent_id_str in state:
             agent_id = AgentId.from_str(agent_id_str)
             if agent_id.type in self._known_agent_names:
@@ -413,11 +490,22 @@ class SingleThreadedAgentRuntime(AgentRuntime):
                     cancellation_token=message_envelope.cancellation_token,
                     message_id=message_envelope.message_id,
                 )
-                with MessageHandlerContext.populate_context(recipient_agent.id):
-                    response = await recipient_agent.on_message(
-                        message_envelope.message,
-                        ctx=message_context,
-                    )
+                with self._tracer_helper.trace_block(
+                    "process",
+                    recipient_agent.id,
+                    parent=message_envelope.metadata,
+                    attributes=await self._create_otel_attributes(
+                        sender_agent_id=message_envelope.sender,
+                        recipient_agent_id=recipient,
+                        message_context=message_context,
+                        message=message_envelope.message,
+                    ),
+                ):
+                    with MessageHandlerContext.populate_context(recipient_agent.id):
+                        response = await recipient_agent.on_message(
+                            message_envelope.message,
+                            ctx=message_context,
+                        )
             except CancelledError as e:
                 if not message_envelope.future.cancelled():
                     message_envelope.future.set_exception(e)
@@ -499,7 +587,17 @@ class SingleThreadedAgentRuntime(AgentRuntime):
                     agent = await self._get_agent(agent_id)
 
                     async def _on_message(agent: Agent, message_context: MessageContext) -> Any:
-                        with self._tracer_helper.trace_block("process", agent.id, parent=None):
+                        with self._tracer_helper.trace_block(
+                            "process",
+                            agent.id,
+                            parent=message_envelope.metadata,
+                            attributes=await self._create_otel_attributes(
+                                sender_agent_id=message_envelope.sender,
+                                recipient_agent_id=agent.id,
+                                message_context=message_context,
+                                message=message_envelope.message,
+                            ),
+                        ):
                             with MessageHandlerContext.populate_context(agent.id):
                                 try:
                                     return await agent.on_message(
@@ -515,21 +613,30 @@ class SingleThreadedAgentRuntime(AgentRuntime):
                                             exception=e,
                                         )
                                     )
-                                    raise
+                                    raise e
 
                     future = _on_message(agent, message_context)
                     responses.append(future)
 
                 await asyncio.gather(*responses)
-            except BaseException:
-                # Ignore exceptions raised during publishing. We've already logged them above.
-                pass
+            except BaseException as e:
+                if not self._ignore_unhandled_handler_exceptions:
+                    self._background_exception = e
             finally:
                 self._message_queue.task_done()
             # TODO if responses are given for a publish
 
     async def _process_response(self, message_envelope: ResponseMessageEnvelope) -> None:
-        with self._tracer_helper.trace_block("ack", message_envelope.recipient, parent=message_envelope.metadata):
+        with self._tracer_helper.trace_block(
+            "ack",
+            message_envelope.recipient,
+            parent=message_envelope.metadata,
+            attributes=await self._create_otel_attributes(
+                sender_agent_id=message_envelope.sender,
+                recipient_agent_id=message_envelope.recipient,
+                message=message_envelope.message,
+            ),
+        ):
             content = (
                 message_envelope.message.__dict__
                 if hasattr(message_envelope.message, "__dict__")
@@ -552,15 +659,28 @@ class SingleThreadedAgentRuntime(AgentRuntime):
             self._message_queue.task_done()
 
     async def process_next(self) -> None:
-        """Process the next message in the queue."""
+        """Process the next message in the queue.
+
+        If there is an unhandled exception in the background task, it will be raised here. `process_next` cannot be called again after an unhandled exception is raised.
+        """
         await self._process_next()
 
     async def _process_next(self) -> None:
         """Process the next message in the queue."""
 
+        if self._background_exception is not None:
+            e = self._background_exception
+            self._background_exception = None
+            self._message_queue.shutdown(immediate=True)  # type: ignore
+            raise e
+
         try:
             message_envelope = await self._message_queue.get()
         except QueueShutDown:
+            if self._background_exception is not None:
+                e = self._background_exception
+                self._background_exception = None
+                raise e from None
             return
 
         match message_envelope:
@@ -637,6 +757,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
                                 return
 
                         message_envelope.message = temp_message
+
                 task = asyncio.create_task(self._process_publish(message_envelope))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
@@ -676,10 +797,20 @@ class SingleThreadedAgentRuntime(AgentRuntime):
 
         .. code-block:: python
 
+            import asyncio
             from autogen_core import SingleThreadedAgentRuntime
 
-            runtime = SingleThreadedAgentRuntime()
-            runtime.start()
+
+            async def main() -> None:
+                runtime = SingleThreadedAgentRuntime()
+                runtime.start()
+
+                # ... do other things ...
+
+                await runtime.stop()
+
+
+            asyncio.run(main())
 
         """
         if self._run_context is not None:
@@ -701,19 +832,23 @@ class SingleThreadedAgentRuntime(AgentRuntime):
         if self._run_context is None:
             raise RuntimeError("Runtime is not started")
 
-        await self._run_context.stop()
-        self._run_context = None
-        self._message_queue = Queue()
+        try:
+            await self._run_context.stop()
+        finally:
+            self._run_context = None
+            self._message_queue = Queue()
 
     async def stop_when_idle(self) -> None:
         """Stop the runtime message processing loop when there is
         no outstanding message being processed or queued. This is the most common way to stop the runtime."""
         if self._run_context is None:
             raise RuntimeError("Runtime is not started")
-        await self._run_context.stop_when_idle()
 
-        self._run_context = None
-        self._message_queue = Queue()
+        try:
+            await self._run_context.stop_when_idle()
+        finally:
+            self._run_context = None
+            self._message_queue = Queue()
 
     async def stop_when(self, condition: Callable[[], bool]) -> None:
         """Stop the runtime message processing loop when the condition is met.
@@ -765,7 +900,7 @@ class SingleThreadedAgentRuntime(AgentRuntime):
             else:
                 agent_instance = maybe_agent_instance
 
-            if type_func_alias(agent_instance) != expected_class:
+            if expected_class is not None and type_func_alias(agent_instance) != expected_class:
                 raise ValueError("Factory registered using the wrong type.")
 
             return agent_instance

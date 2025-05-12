@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import io
@@ -5,8 +6,10 @@ import json
 import logging
 import os
 import re
+import sys
 import time
 import traceback
+import warnings
 from typing import (
     Any,
     AsyncGenerator,
@@ -21,7 +24,7 @@ import aiofiles
 import PIL.Image
 from autogen_agentchat.agents import BaseChatAgent
 from autogen_agentchat.base import Response
-from autogen_agentchat.messages import AgentEvent, ChatMessage, MultiModalMessage, TextMessage
+from autogen_agentchat.messages import BaseAgentEvent, BaseChatMessage, MultiModalMessage, TextMessage
 from autogen_agentchat.utils import content_to_str, remove_images
 from autogen_core import EVENT_LOGGER_NAME, CancellationToken, Component, ComponentModel, FunctionCall
 from autogen_core import Image as AGImage
@@ -112,6 +115,18 @@ class MultimodalWebSurfer(BaseChatAgent, Component[MultimodalWebSurferConfig]):
         Please note that using the MultimodalWebSurfer involves interacting with a digital world designed for humans, which carries inherent risks.
         Be aware that agents may occasionally attempt risky actions, such as recruiting humans for help or accepting cookie agreements without human involvement. Always ensure agents are monitored and operate within a controlled environment to prevent unintended consequences.
         Moreover, be cautious that MultimodalWebSurfer may be susceptible to prompt injection attacks from webpages.
+
+    .. note::
+
+        On Windows, the event loop policy must be set to `WindowsProactorEventLoopPolicy` to avoid issues with subprocesses.
+
+        .. code-block:: python
+
+            import sys
+            import asyncio
+
+            if sys.platform == "win32":
+                asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
     Args:
         name (str): The name of the agent.
@@ -277,6 +292,22 @@ class MultimodalWebSurfer(BaseChatAgent, Component[MultimodalWebSurferConfig]):
         """
         On the first call, we initialize the browser and the page.
         """
+
+        # Check the current event loop policy if on windows.
+        if sys.platform == "win32":
+            current_policy = asyncio.get_event_loop_policy()
+            if hasattr(asyncio, "WindowsProactorEventLoopPolicy") and not isinstance(
+                current_policy, asyncio.WindowsProactorEventLoopPolicy
+            ):
+                warnings.warn(
+                    "The current event loop policy is not WindowsProactorEventLoopPolicy. "
+                    "This may cause issues with subprocesses. "
+                    "Try setting the event loop policy to WindowsProactorEventLoopPolicy. "
+                    "For example: `asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())`. "
+                    "See https://docs.python.org/3/library/asyncio-eventloop.html#asyncio.ProactorEventLoop.",
+                    stacklevel=2,
+                )
+
         self._last_download = None
         self._prior_metadata_hash = None
 
@@ -354,7 +385,7 @@ class MultimodalWebSurfer(BaseChatAgent, Component[MultimodalWebSurferConfig]):
             )
 
     @property
-    def produced_message_types(self) -> Sequence[type[ChatMessage]]:
+    def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
         return (MultiModalMessage,)
 
     async def on_reset(self, cancellation_token: CancellationToken) -> None:
@@ -391,21 +422,19 @@ class MultimodalWebSurfer(BaseChatAgent, Component[MultimodalWebSurferConfig]):
             )
         )
 
-    async def on_messages(self, messages: Sequence[ChatMessage], cancellation_token: CancellationToken) -> Response:
+    async def on_messages(self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken) -> Response:
         async for message in self.on_messages_stream(messages, cancellation_token):
             if isinstance(message, Response):
                 return message
         raise AssertionError("The stream should have returned the final result.")
 
     async def on_messages_stream(
-        self, messages: Sequence[ChatMessage], cancellation_token: CancellationToken
-    ) -> AsyncGenerator[AgentEvent | ChatMessage | Response, None]:
+        self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken
+    ) -> AsyncGenerator[BaseAgentEvent | BaseChatMessage | Response, None]:
         for chat_message in messages:
-            if isinstance(chat_message, TextMessage | MultiModalMessage):
-                self._chat_history.append(UserMessage(content=chat_message.content, source=chat_message.source))
-            else:
-                raise ValueError(f"Unexpected message in MultiModalWebSurfer: {chat_message}")
-        self.inner_messages: List[AgentEvent | ChatMessage] = []
+            self._chat_history.append(chat_message.to_model_message())
+
+        self.inner_messages: List[BaseAgentEvent | BaseChatMessage] = []
         self.model_usage: List[RequestUsage] = []
         try:
             content = await self._generate_reply(cancellation_token=cancellation_token)

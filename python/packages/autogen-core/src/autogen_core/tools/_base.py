@@ -1,29 +1,36 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Any, Dict, Generic, Mapping, Protocol, Type, TypedDict, TypeVar, cast, runtime_checkable
+from typing import Any, Dict, Generic, Mapping, Protocol, Type, TypeVar, cast, runtime_checkable
 
 import jsonref
+from opentelemetry.trace import get_tracer
 from pydantic import BaseModel
-from typing_extensions import NotRequired
+from typing_extensions import NotRequired, TypedDict
 
-from .. import CancellationToken
+from .. import EVENT_LOGGER_NAME, CancellationToken
 from .._component_config import ComponentBase
 from .._function_utils import normalize_annotated_type
+from ..logging import ToolCallEvent
 
 T = TypeVar("T", bound=BaseModel, contravariant=True)
+
+logger = logging.getLogger(EVENT_LOGGER_NAME)
 
 
 class ParametersSchema(TypedDict):
     type: str
     properties: Dict[str, Any]
     required: NotRequired[Sequence[str]]
+    additionalProperties: NotRequired[bool]
 
 
 class ToolSchema(TypedDict):
     parameters: NotRequired[ParametersSchema]
     name: str
     description: NotRequired[str]
+    strict: NotRequired[bool]
 
 
 @runtime_checkable
@@ -47,9 +54,9 @@ class Tool(Protocol):
 
     async def run_json(self, args: Mapping[str, Any], cancellation_token: CancellationToken) -> Any: ...
 
-    def save_state_json(self) -> Mapping[str, Any]: ...
+    async def save_state_json(self) -> Mapping[str, Any]: ...
 
-    def load_state_json(self, state: Mapping[str, Any]) -> None: ...
+    async def load_state_json(self, state: Mapping[str, Any]) -> None: ...
 
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel, contravariant=True)
@@ -66,12 +73,14 @@ class BaseTool(ABC, Tool, Generic[ArgsT, ReturnT], ComponentBase[BaseModel]):
         return_type: Type[ReturnT],
         name: str,
         description: str,
+        strict: bool = False,
     ) -> None:
         self._args_type = args_type
         # Normalize Annotated to the base type.
         self._return_type = normalize_annotated_type(return_type)
         self._name = name
         self._description = description
+        self._strict = strict
 
     @property
     def schema(self) -> ToolSchema:
@@ -81,18 +90,32 @@ class BaseTool(ABC, Tool, Generic[ArgsT, ReturnT], ComponentBase[BaseModel]):
             model_schema = cast(Dict[str, Any], jsonref.replace_refs(obj=model_schema, proxies=False))  # type: ignore
             del model_schema["$defs"]
 
+        parameters = ParametersSchema(
+            type="object",
+            properties=model_schema["properties"],
+            required=model_schema.get("required", []),
+            additionalProperties=model_schema.get("additionalProperties", False),
+        )
+
+        # If strict is enabled, the tool schema should list all properties as required.
+        assert "required" in parameters
+        if self._strict and set(parameters["required"]) != set(parameters["properties"].keys()):
+            raise ValueError(
+                "Strict mode is enabled, but not all input arguments are marked as required. Default arguments are not allowed in strict mode."
+            )
+
+        assert "additionalProperties" in parameters
+        if self._strict and parameters["additionalProperties"]:
+            raise ValueError(
+                "Strict mode is enabled but additional argument is also enabled. This is not allowed in strict mode."
+            )
+
         tool_schema = ToolSchema(
             name=self._name,
             description=self._description,
-            parameters=ParametersSchema(
-                type="object",
-                properties=model_schema["properties"],
-            ),
+            parameters=parameters,
+            strict=self._strict,
         )
-        if "required" in model_schema:
-            assert "parameters" in tool_schema
-            tool_schema["parameters"]["required"] = model_schema["required"]
-
         return tool_schema
 
     @property
@@ -125,13 +148,31 @@ class BaseTool(ABC, Tool, Generic[ArgsT, ReturnT], ComponentBase[BaseModel]):
     async def run(self, args: ArgsT, cancellation_token: CancellationToken) -> ReturnT: ...
 
     async def run_json(self, args: Mapping[str, Any], cancellation_token: CancellationToken) -> Any:
-        return_value = await self.run(self._args_type.model_validate(args), cancellation_token)
+        with get_tracer("base_tool").start_as_current_span(
+            self._name,
+            attributes={
+                "tool_name": self._name,
+                "tool_description": self._description,
+                "tool_args": json.dumps(args),
+            },
+        ):
+            # Execute the tool's run method
+            return_value = await self.run(self._args_type.model_validate(args), cancellation_token)
+
+        # Log the tool call event
+        event = ToolCallEvent(
+            tool_name=self.name,
+            arguments=dict(args),  # Using the raw args passed to run_json
+            result=self.return_value_as_string(return_value),
+        )
+        logger.info(event)
+
         return return_value
 
-    def save_state_json(self) -> Mapping[str, Any]:
+    async def save_state_json(self) -> Mapping[str, Any]:
         return {}
 
-    def load_state_json(self, state: Mapping[str, Any]) -> None:
+    async def load_state_json(self, state: Mapping[str, Any]) -> None:
         pass
 
 
@@ -155,8 +196,8 @@ class BaseToolWithState(BaseTool[ArgsT, ReturnT], ABC, Generic[ArgsT, ReturnT, S
     @abstractmethod
     def load_state(self, state: StateT) -> None: ...
 
-    def save_state_json(self) -> Mapping[str, Any]:
+    async def save_state_json(self) -> Mapping[str, Any]:
         return self.save_state().model_dump()
 
-    def load_state_json(self, state: Mapping[str, Any]) -> None:
+    async def load_state_json(self, state: Mapping[str, Any]) -> None:
         self.load_state(self._state_type.model_validate(state))

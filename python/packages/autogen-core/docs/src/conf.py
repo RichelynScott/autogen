@@ -92,7 +92,6 @@ html_logo = "_static/images/logo/logo.svg"
 html_favicon = "_static/images/logo/favicon-512x512.png"
 
 html_theme_options = {
-
     "header_links_before_dropdown": 6,
     "navbar_align": "left",
     "check_switcher": False,
@@ -131,11 +130,12 @@ html_theme_options = {
     },
     "show_version_warning_banner": True,
     "external_links": [
+      {"name": ".NET", "url": "https://microsoft.github.io/autogen/dotnet/"},
       {"name": "0.2 Docs", "url": "https://microsoft.github.io/autogen/0.2/"},
     ]
 }
 
-html_js_files = ["custom-icon.js", "banner-override.js"]
+html_js_files = ["custom-icon.js", "banner-override.js", "custom.js"]
 html_sidebars = {
     "packages/index": [],
     "user-guide/core-user-guide/**": ["sidebar-nav-bs-core"],

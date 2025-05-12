@@ -24,6 +24,7 @@ class Handoff(BaseModel):
 
     message: str = Field(default="")
     """The message to the target agent.
+    By default, it will be the result for the handoff tool.
     If not provided, it is generated from the target agent's name."""
 
     @model_validator(mode="before")
@@ -53,4 +54,9 @@ class Handoff(BaseModel):
         def _handoff_tool() -> str:
             return self.message
 
-        return FunctionTool(_handoff_tool, name=self.name, description=self.description)
+        return FunctionTool(_handoff_tool, name=self.name, description=self.description, strict=True)
+
+    """
+    The tool that can be used to handoff to the target agent.
+    Typically, the results of the tool's execution are provided to the target agent.
+    """

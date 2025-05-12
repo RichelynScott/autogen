@@ -62,7 +62,7 @@ class AgentRuntime(Protocol):
 
         Args:
             message (Any): The message to publish.
-            topic (TopicId): The topic to publish the message to.
+            topic_id (TopicId): The topic to publish the message to.
             sender (AgentId | None, optional): The agent which sent the message. Defaults to None.
             cancellation_token (CancellationToken | None, optional): Token used to cancel an in progress. Defaults to None.
             message_id (str | None, optional): The message id. If None, a new message id will be generated. Defaults to None. This message id must be unique. and is recommended to be a UUID.
@@ -126,7 +126,7 @@ class AgentRuntime(Protocol):
         Args:
             type (str): The type of agent this factory creates. It is not the same as agent class name. The `type` parameter is used to differentiate between different factory functions rather than agent classes.
             agent_factory (Callable[[], T]): The factory that creates the agent, where T is a concrete Agent type. Inside the factory, use `autogen_core.AgentInstantiationContext` to access variables like the current runtime and agent ID.
-            expected_class (type[T] | None, optional): The expected class of the agent, used for runtime validation of the factory. Defaults to None.
+            expected_class (type[T] | None, optional): The expected class of the agent, used for runtime validation of the factory. Defaults to None. If None, no validation is performed.
         """
         ...
 
